@@ -22,6 +22,8 @@ Erizo.Room = function (spec) {
         sendDataSocket,
         updateAttributes,
         removeStream,
+        checkTokenTimeout,
+        tokenTimeout = undefined,
         DISCONNECTED = 0,
         CONNECTING = 1,
         CONNECTED = 2;
@@ -63,6 +65,9 @@ Erizo.Room = function (spec) {
             that.socket.disconnect();
         } catch (error) {
             L.Logger.debug("Socket already disconnected");
+        }
+        if (tokenTimeout) {
+            clearTimeout(tokenTimeout);
         }
         that.socket = undefined;
     });
@@ -205,6 +210,8 @@ Erizo.Room = function (spec) {
             }
         });
 
+        checkTokenTimeout(token);
+
         // First message with the token
         sendMessageSocket('token', token, callback, error);
     };
@@ -231,6 +238,25 @@ Erizo.Room = function (spec) {
                 callback(response, respCallback);
             }
         });
+    };
+
+    // check for timed tokens, and signal that a new token is required
+    checkTokenTimeout = function(token) {
+        L.Logger.info("checkTokenTimeout: " + JSON.stringify(token));
+        if (tokenTimeout) {
+            clearTimeout(tokenTimeout);
+        }
+
+        if (token.duration) {
+            var refreshTime = (token.duration - 10);
+            if (refreshTime < 1) {
+                refreshTime = 1;
+            }
+            tokenTimeout = setTimeout(function() {
+                var refreshTokenEvt = Erizo.RoomEvent({type:'request-new-token'});
+                that.dispatchEvent(refreshTokenEvt);
+            }, refreshTime * 1000);
+        }
     };
 
     // Public functions
@@ -284,6 +310,14 @@ Erizo.Room = function (spec) {
         // 1- Disconnect from room
         var disconnectEvt = Erizo.RoomEvent({type: "room-disconnected"});
         that.dispatchEvent(disconnectEvt);
+    };
+
+    // send a token to the server, to change user role or confirm token after certain amount of time
+    that.refreshToken = function(tokenRaw, callback, callbackError) {
+        L.Logger.info("Refreshing token");
+        var token = JSON.parse(L.Base64.decodeBase64(tokenRaw));
+        checkTokenTimeout(token);
+        sendMessageSocket('refreshToken', token, callback, callbackError);
     };
 
     // It publishes the stream provided as argument. Once it is added it throws a

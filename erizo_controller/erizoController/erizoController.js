@@ -269,6 +269,20 @@ var updateMyState = function () {
     rpc.callRpc('nuve', 'setInfo', info, {callback: function () {}});
 };
 
+// check a token for its duration and prepare to revoke stuff, when appropriate
+var checkTimedToken = function(socket, token) {
+    if (socket.tokenExpiration) {
+        clearTimeout(socket.tokenExpiration);
+    }
+
+    if (token.duration) {
+        socket.tokenExpiration = setTimeout(function() {
+            log.debug("Token expired!");
+            socket.disconnect();
+        }, token.duration * 1000);
+    }
+}
+
 var listen = function () {
     "use strict";
 
@@ -357,9 +371,12 @@ var listen = function () {
                             }
                         }
 
+                        checkTimedToken(socket, tokenDB);
+
                         callback('success', {streams: streamList,
                                             id: socket.room.id,
                                             p2p: socket.room.p2p,
+                                            permissions: socket.user.permissions,
                                             defaultVideoBW: GLOBAL.config.erizoController.defaultVideoBW,
                                             maxVideoBW: GLOBAL.config.erizoController.maxVideoBW,
                                             stunServerUrl: GLOBAL.config.erizoController.stunServerUrl,
@@ -368,6 +385,80 @@ var listen = function () {
 
                     } else {
                         log.warn('Invalid host');
+                        callback('error', 'Invalid host');
+                        socket.disconnect();
+                    }
+                }});
+
+            } else {
+                log.warn("Authentication error");
+                callback('error', 'Authentication error');
+                socket.disconnect();
+            }
+        });
+
+        // Gets 'token' messages on the socket. Checks the signature and ask nuve if it is valid.
+        // Then registers it in the room and callback to the client.
+        socket.on('refreshToken', function (token, callback) {
+
+            log.debug("Refresh token", token);
+
+            var tokenDB, user, index;
+
+            if (checkSignature(token, nuveKey)) {
+
+                rpc.callRpc('nuve', 'deleteToken', token.tokenId, {callback: function (resp) {
+                    if (!socket || !socket.room) {
+                        log.info('Refreshing token on dead socket');
+                        callback('error', 'Connection is dead');
+                    } else
+                    if (resp === 'error') {
+                        log.info('Refresh token does not exist');
+                        callback('error', 'Token does not exist');
+                        socket.disconnect();
+
+                    } else if (resp === 'timeout') {
+                        log.warn('Nuve does not respond');
+                        callback('error', 'Nuve does not respond');
+                        socket.disconnect();
+
+                    } else if (token.host === resp.host) {
+                        tokenDB = resp;
+                        user = {name: tokenDB.userName, role: tokenDB.role};
+                        socket.user = user;
+                        var permissions = GLOBAL.config.erizoController.roles[tokenDB.role] || [];
+                        socket.user.permissions = {};
+                        for (var right in permissions) {
+                            socket.user.permissions[right] = permissions[right];
+                        }
+
+                        if (!permissions[Permission.PUBLISH]) {
+                            // TODO dk: this needs to remember what was previously published
+                            // might be a list of things even.
+                        }
+                        
+                        if (!permissions[Permission.SUBSCRIBE]) {
+                        	// TODO dk: this needs to cut subscribed streams
+                        }
+                        
+                        // TODO dk: how to react to recording?
+
+                        log.debug('OK, Valid refresh token');
+
+                        checkTimedToken(socket, tokenDB);
+
+                        callback('success', {
+                                            id: socket.room.id,
+                                            p2p: socket.room.p2p,
+                                            permissions: socket.user.permissions,
+                                            defaultVideoBW: GLOBAL.config.erizoController.defaultVideoBW,
+                                            maxVideoBW: GLOBAL.config.erizoController.maxVideoBW,
+                                            stunServerUrl: GLOBAL.config.erizoController.stunServerUrl,
+                                            turnServer: GLOBAL.config.erizoController.turnServer
+                                            });
+
+                    } else {
+                        log.warn('Invalid host in refresh token');
                         callback('error', 'Invalid host');
                         socket.disconnect();
                     }
@@ -640,6 +731,10 @@ var listen = function () {
 
             log.info('Socket disconnect ', socket.id);
 
+            if (socket.tokenExpiration) {
+                clearTimeout(socket.tokenExpiration);
+                socket.tokenExpiration = undefined;
+            }
             for (i in socket.streams) {
                 if (socket.streams.hasOwnProperty(i)) {
                     sendMsgToRoom(socket.room, 'onRemoveStream', {id: socket.streams[i]});

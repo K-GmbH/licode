@@ -59,6 +59,7 @@ app.get('/rooms/:room', roomResource.represent);
 app.delete('/rooms/:room', roomResource.deleteRoom);
 
 app.post('/rooms/:room/tokens', tokensResource.create);
+app.post('/rooms/:room/timedtokens', tokensResource.createTimed);
 
 app.post('/services', servicesResource.create);
 app.get('/services', servicesResource.represent);

@@ -12,6 +12,8 @@ var log = logger.getLogger("TokensResource");
 
 var currentService;
 var currentRoom;
+// default token duration, in seconds
+var TOKEN_DURATION = 60;
 
 /*
  * Gets the service and the room for the proccess of the request.
@@ -39,19 +41,33 @@ var getTokenString = function (id, token) {
             tokenId: id,
             host: token.host,
             secure: token.secure,
-            signature: signed
+            signature: signed,
+            duration: token.duration
         },
         tokenS = (new Buffer(JSON.stringify(tokenJ))).toString('base64');
 
     return tokenS;
 };
 
+
+/*
+ * Generates new token.
+ * The format of a token is:
+ * {tokenId: id, host: erizoController host, signature: signature of the token, duration: how long it is valid in seconds };
+ * this function will not set a duration, though
+ */
+var generateToken = function(callback) {
+    "use strict";
+
+    generateTimedToken(undefined, callback);
+}
+
 /*
  * Generates new token. 
  * The format of a token is:
- * {tokenId: id, host: erizoController host, signature: signature of the token};
+ * {tokenId: id, host: erizoController host, signature: signature of the token, duration: how long it is valid in seconds };
  */
-var generateToken = function (callback) {
+var generateTimedToken = function (durationTime, callback) {
     "use strict";
 
     var user = require('./../auth/nuveAuthenticator').user,
@@ -72,6 +88,9 @@ var generateToken = function (callback) {
     token.role = role;
     token.service = currentService._id;
     token.creationDate = new Date();
+    if (durationTime) {
+        token.duration = durationTime;
+    }
 
     // Values to be filled from the erizoController
     token.secure = false;
@@ -163,6 +182,42 @@ exports.create = function (req, res) {
         }
 
         generateToken(function (tokenS) {
+
+            if (tokenS === undefined) {
+                res.send('Name and role?', 401);
+                return;
+            }
+            if (tokenS === 'error') {
+                res.send('CloudHandler does not respond', 401);
+                return;
+            }
+            log.info('Created token for room ', currentRoom._id, 'and service ', currentService._id);
+            res.send(tokenS);
+        });
+    });
+};
+
+/*
+ * Post Token. Creates a new token for a determined room of a service, with a time limit
+ */
+exports.createTimed = function (req, res) {
+    "use strict";
+
+    doInit(req.params.room, function () {
+
+        if (currentService === undefined) {
+            log.info('Service not found');
+            res.send('Service not found', 404);
+            return;
+        } else if (currentRoom === undefined) {
+            log.info('Room ', req.params.room, ' does not exist');
+            res.send('Room does not exist', 404);
+            return;
+        }
+        
+        var duration = req.params.duration || TOKEN_DURATION;
+
+        generateTimedToken(duration, function (tokenS) {
 
             if (tokenS === undefined) {
                 res.send('Name and role?', 401);
