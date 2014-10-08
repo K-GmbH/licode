@@ -348,7 +348,8 @@ var listen = function () {
                         log.debug('OK, Valid token');
 
                         if (!tokenDB.p2p && GLOBAL.config.erizoController.sendStats) {
-                            rpc.callRpc('stats_handler', 'event', [{room: tokenDB.room, user: socket.id, type: 'connection'}]);
+                            var timeStamp = new Date();
+                            rpc.callRpc('stats_handler', 'event', [{room: tokenDB.room, user: socket.id, type: 'connection', timestamp:timeStamp.getTime()}]);
                         }
 
                         for (index in socket.room.streams) {
@@ -447,19 +448,21 @@ var listen = function () {
                         answer = answer.replace(privateRegexp, publicIP);
                         callback(answer, id);
                     }, function() {
+                        st = new ST.Stream({id: id, audio: options.audio, video: options.video, data: options.data, screen: options.screen, attributes: options.attributes});
+                        socket.state = 'sleeping';
+                        socket.streams.push(id);
+                        socket.room.streams[id] = st;
+
                         if (socket.room.streams[id] !== undefined) {
                             sendMsgToRoom(socket.room, 'onAddStream', socket.room.streams[id].getPublicStream());
                         }
                         if (GLOBAL.config.erizoController.sendStats) {
-                            rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'publish', stream: id}]);
+                            var timeStamp = new Date();
+                            rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'publish', stream: id, timestamp: timeStamp.getTime()}]);
                         }
                     });
 
                 } else if (options.state === 'ok' && socket.state === 'waitingOk') {
-                    st = new ST.Stream({id: options.streamId, socket: socket.id, audio: options.audio, video: options.video, data: options.data, screen: options.screen, attributes: options.attributes});
-                    socket.state = 'sleeping';
-                    socket.streams.push(options.streamId);
-                    socket.room.streams[options.streamId] = st;
                 }
             } else if (options.state === 'p2pSignaling') {
                 io.sockets.socket(options.subsSocket).emit('onPublishP2P', {sdp: sdp, streamId: options.streamId}, function(answer) {
@@ -514,7 +517,8 @@ var listen = function () {
                         callback(answer);
                     }, function() {
                         if (GLOBAL.config.erizoController.sendStats) {
-                            rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'subscribe', stream: options.streamId}]);
+                            var timeStamp = new Date();
+                            rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'subscribe', stream: options.streamId, timestamp: timeStamp.getTime()}]);
                         }
                         log.info("Subscriber added");
                     });
@@ -596,7 +600,8 @@ var listen = function () {
                 if (!socket.room.p2p) {
                     socket.room.controller.removePublisher(streamId);
                     if (GLOBAL.config.erizoController.sendStats) {
-                        rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unpublish', stream: streamId}]);
+                        var timeStamp = new Date();
+                        rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unpublish', stream: streamId, timestamp: timeStamp.getTime()}]);
                     }
                 }
             }
@@ -627,7 +632,8 @@ var listen = function () {
                 if (!socket.room.p2p) {
                     socket.room.controller.removeSubscriber(socket.id, to);
                     if (GLOBAL.config.erizoController.sendStats) {
-                        rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unsubscribe', stream: to}]);
+                        var timeStamp = new Date();
+                        rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unsubscribe', stream: to, timestamp:timeStamp.getTime()}]);
                     }
                 };
             }
@@ -671,7 +677,8 @@ var listen = function () {
                             if (!socket.room.p2p) {
                                 socket.room.controller.removePublisher(id);
                                 if (GLOBAL.config.erizoController.sendStats) {
-                                    rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unpublish', stream: id}]);
+                                    var timeStamp = new Date();
+                                    rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'unpublish', stream: id, timestamp: timeStamp.getTime()}]);
                                 }
                             }
 
@@ -685,7 +692,8 @@ var listen = function () {
             }
 
             if (socket.room !== undefined && !socket.room.p2p && GLOBAL.config.erizoController.sendStats) {
-                rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'disconnection'}]);
+                var timeStamp = new Date();
+                rpc.callRpc('stats_handler', 'event', [{room: socket.room.id, user: socket.id, type: 'disconnection', timestamp: timeStamp.getTime()}]);
             }
 
             if (socket.room !== undefined && socket.room.sockets.length === 0) {
