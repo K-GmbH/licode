@@ -5,6 +5,7 @@
 #include <queue>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread.hpp>
+#include <sys/time.h>
 
 #include "logger.h"
 #include "SdpInfo.h"
@@ -151,6 +152,65 @@ private:
 
 	boost::condition_variable cond_;
     webrtc::FecReceiverImpl fec_receiver_;
+
+    struct {
+        uint32_t lastSR;
+        uint32_t lastFractionLost:8;
+        uint32_t lastPacketLostCount:24;
+        int currentPacketCount, currentDataCount;
+
+        struct timeval timestamp;
+        float allowedSize;
+        float desiredSize;
+
+        char* tempBuf;
+        int tempLen;
+
+        int jitterEnhancer;
+        uint32_t lastJitter;
+    } rtpDataTracker_;
+
+    struct RtcpData {
+        // lost packets - list and length
+        uint32_t *nackList;
+        int nackLen;
+
+        // current values - tracks packet lost for fraction calculation
+        int packetCount, lostPacketCount;
+
+        uint32_t ssrc;
+        uint32_t totalPacketsLost;
+        uint32_t sequenceCycles:16;
+        uint32_t sequenceNumber:16;
+        // last SR field
+        uint32_t lastSrTimestamp;
+        // required to properly calculate DLSR
+        struct timeval lastSrReception;
+
+        // to prevent sending too many reports, track time of last
+        struct timeval lastRrSent;
+        // flag to send receiver report
+        bool requestRr;
+        bool hasSentFirstRr;
+
+        // time based data flow limits
+        float allowedSize, desiredSize;
+        struct timeval timestamp;
+    } rtcpData_;
+    // change the content of Receiver Reports
+    void modifyRtcpRR(char *buf, int len);
+    // measures flow on the connection for receiver reports
+    bool measureRtpFlow(char *buf, int len);
+    // simple log output of a buffer
+    void logBuffer(char *buf, int len);
+
+    void discardPacket(char *buf, int len);
+    void checkPacket(char **p_buf, int *p_len);
+
+    // check transport state of this packet, checks for nack listing, etc
+    bool checkTransport(char *buf, int len, struct RtcpData *pData);
+    // send a receiver report
+    void sendReceiverReport(struct RtcpData *pData);
 };
 
 } /* namespace erizo */
