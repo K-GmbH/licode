@@ -14,6 +14,10 @@
 namespace erizo {
   DEFINE_LOGGER(WebRtcConnection, "WebRtcConnection");
 
+  // time between receiver reports
+  const unsigned int RTCP_MAX_TIME = 5000;
+  const unsigned int RTCP_MIN_TIME = 1000;
+
   WebRtcConnection::WebRtcConnection(bool audioEnabled, bool videoEnabled, const std::string &stunServer, int stunPort, int minPort, int maxPort)
       : fec_receiver_(this) {
     ELOG_WARN("WebRtcConnection constructor stunserver %s stunPort %d minPort %d maxPort %d\n", stunServer.c_str(), stunPort, minPort, maxPort);
@@ -41,6 +45,19 @@ namespace erizo {
     
     sending_ = true;
     send_Thread_ = boost::thread(&WebRtcConnection::sendLoop, this);
+
+    rtpDataTracker_.lastSR = 0;
+    rtpDataTracker_.lastFractionLost = 0;
+    rtpDataTracker_.lastPacketLostCount= 0;
+    rtpDataTracker_.currentPacketCount = 0;
+    rtpDataTracker_.currentDataCount = 0;
+    gettimeofday(&rtpDataTracker_.timestamp, NULL);
+    rtpDataTracker_.allowedSize = 0;
+    rtpDataTracker_.jitterEnhancer = 0;
+
+    memset((void*)&rtcpData_, 0, sizeof(struct RtcpData));
+    gettimeofday(&rtcpData_.timestamp, NULL);
+    rtcpData_.timestamp.tv_sec -= 1;
   }
 
   WebRtcConnection::~WebRtcConnection() {
@@ -296,7 +313,10 @@ namespace erizo {
           if (chead->packettype != RTCP_Sender_PT) {
             head->setSSRC(this->getVideoSinkSSRC());
           }
-          videoSink_->deliverVideoData(buf, len);
+
+          if (checkTransport(buf, len, &rtcpData_)) {
+              videoSink_->deliverVideoData(buf, len);
+          }
         }
       }
     }
@@ -542,5 +562,286 @@ namespace erizo {
           }
       }
   }
+
+  bool WebRtcConnection::measureRtpFlow(char *buf, int len) {
+      ++rtpDataTracker_.currentPacketCount;
+      rtpDataTracker_.currentDataCount += len;
+//      ELOG_DEBUG("(%p)measureRptFlow => packets: %i; data: %i", (void*)this, rtpDataTracker_.currentPacketCount, rtpDataTracker_.currentDataCount);
+
+      struct timeval now;
+      gettimeofday(&now, NULL);
+      unsigned int dt = (now.tv_sec - rtpDataTracker_.timestamp.tv_sec) * 1000 + (now.tv_usec - rtpDataTracker_.timestamp.tv_usec) / 1000;
+
+
+      // float dataspeed = rtpDataTracker_.currentDataCount / (float) dt;
+      // kB/s = kbit/s / 8
+      float maxspeed = 168.0f / 8.0f;
+      // ELOG_DEBUG("(%p)measureRtpFlow: dataspeed: %f = %i / %i", (void*)this, dataspeed, rtpDataTracker_.currentDataCount, dt);
+      // return dataspeed <= maxspeed;
+
+      rtpDataTracker_.allowedSize += dt * maxspeed;
+      rtpDataTracker_.desiredSize += dt * maxspeed / 2;
+      rtpDataTracker_.timestamp = now;
+      ELOG_DEBUG("allowedSize: %f", rtpDataTracker_.allowedSize);
+      return len <= rtpDataTracker_.allowedSize;
+  }
+
+  void WebRtcConnection::modifyRtcpRR(char *buf, int len) {
+      RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
+      if (chead->packettype == RTCP_Receiver_PT && chead->length > 3) {
+          uint32_t sr = chead->report.receiverReport.lastsr;
+          if (sr > rtpDataTracker_.lastSR) {
+              ELOG_DEBUG("(%p)ModifyRtcpRR: %i", (void*)this, sr);
+              rtpDataTracker_.lastSR = sr;
+              int bonusJitter = rtpDataTracker_.jitterEnhancer;
+              rtpDataTracker_.lastJitter = chead->report.receiverReport.jitter + bonusJitter;
+
+              rtpDataTracker_.jitterEnhancer = 0;
+          }
+          if (sr == rtpDataTracker_.lastSR) {
+              logBuffer(buf, len);
+//              chead->report.receiverReport.fractionlost = rtpDataTracker_.lastFractionLost;
+//              chead->report.receiverReport.lost = rtpDataTracker_.lastPacketLostCount;
+              chead->report.receiverReport.jitter = rtpDataTracker_.lastJitter;
+              logBuffer(buf, len);
+          }
+      }
+  }
+
+  void WebRtcConnection::logBuffer(char *buf, int len)
+    {
+        char hex[] = "0123456789abcdefghjklmn";
+        char *logstr = new char[len * 3 + 1];
+        logstr[len * 3] = 0;
+        for (int i = 0; i < len; ++i) {
+            unsigned char current = (unsigned char)buf[i];
+            logstr[i * 3 + 0] = hex[current / 16];
+            logstr[i * 3 + 1] = hex[current % 16];
+            logstr[i * 3 + 2] = ' ';
+        }
+        ELOG_DEBUG("LOGBUFFER: %s", logstr);
+        delete[] logstr;
+    }
+
+    void WebRtcConnection::discardPacket(char *buf, int len) {
+        if (rtpDataTracker_.tempBuf != NULL) {
+            delete[] rtpDataTracker_.tempBuf;
+        }
+        rtpDataTracker_.tempBuf = new char[len];
+        rtpDataTracker_.tempLen = len;
+        memcpy((void*)rtpDataTracker_.tempBuf, (void*)buf, len);
+    }
+
+    void WebRtcConnection::checkPacket(char **p_buf, int *p_len) {
+        if (rtpDataTracker_.tempBuf != NULL) {
+            char* buf = rtpDataTracker_.tempBuf;
+            int len = rtpDataTracker_.tempLen;
+
+            rtpDataTracker_.tempBuf = NULL;
+            discardPacket(*p_buf, *p_len);
+
+            *p_buf = buf;
+            *p_len = len;
+        }
+    }
+
+    bool WebRtcConnection::checkTransport(char *buf, int len, struct RtcpData *pData) {
+        // kB/s = kbit/s / 8
+        const float maxspeed = 86.0f / 8.0f;//25;//12.5f;
+
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        unsigned int dt = (now.tv_sec - pData->timestamp.tv_sec) * 1000 + (now.tv_usec - pData->timestamp.tv_usec) / 1000;
+if (pData->timestamp.tv_sec != 0) {        
+        pData->allowedSize += dt * maxspeed * 2;
+        pData->desiredSize += dt * maxspeed;
+}
+        pData->timestamp = now;
+
+        RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
+        if (chead->packettype == RTCP_Sender_PT) {
+            pData->lastSrReception = now;
+            pData->lastSrTimestamp = (uint32_t)(chead->report.senderReport.ntptimestamp >> 16);
+            ELOG_DEBUG("analysed SR - ntp timestamp: %x", pData->lastSrTimestamp);
+            return true;
+        } else if (chead->isRtcp()) {
+            // unrecognized rtcp packet - ignore and send on
+            return true;
+        }
+
+        // this is an rtp packet
+        RtpHeader *head = reinterpret_cast<RtpHeader*>(buf);
+        ++pData->packetCount;
+
+        // nack list check
+        for (int i = 0; i < pData->nackLen; ++i) {
+            if (pData->nackList[i] == head->getSeqNumber()) {
+                ELOG_DEBUG("Received NACK'd packet: %x", head->getSeqNumber());
+                // nack'd? Remove from list and don't send on
+                if (pData->nackLen == 1) {
+                    pData->nackList = NULL;
+                    pData->nackLen  = 0;
+                    pData->requestRr = false;
+                } else {
+                    uint32_t *nackBuf = new uint32_t[pData->nackLen];
+                    memcpy(nackBuf, pData->nackList, i * sizeof(uint32_t));
+                    memcpy(nackBuf + i, pData->nackList + i + 1, (pData->nackLen - i - 1) * sizeof(uint32_t));
+                    delete[] pData->nackList;
+                    pData->nackLen = pData->nackLen - 1;
+                    pData->nackList = nackBuf;
+                }
+                return false;
+            }
+        }
+
+        if (pData->desiredSize < len) {
+            ELOG_DEBUG("pretending to drop %x - len: %i vs %f", head->getSeqNumber(), len, pData->desiredSize);
+            ++pData->lostPacketCount;
+
+            // above what we want to send? remember for nack'ing
+            uint32_t *nackBuf = new uint32_t[pData->nackLen + 1];
+
+            if (pData->nackLen > 0) {
+                memcpy(nackBuf, pData->nackList, pData->nackLen * sizeof(uint32_t));
+            }
+            nackBuf[pData->nackLen] = head->getSeqNumber();
+            delete[] pData->nackList;
+            pData->nackLen += 1;
+            pData->nackList = nackBuf;
+
+            pData->requestRr = true;
+        } else {
+            pData->desiredSize -= len;
+            if (head->getSeqNumber() < pData->sequenceNumber) {
+                ++pData->sequenceCycles;
+            }
+            pData->sequenceNumber = head->getSeqNumber();
+            pData->ssrc = head->getSSRC();
+
+            // ELOG_DEBUG("Valid RTP packet - SSRC: %x  SeqNum: %x", head->getSSRC(), head->getSeqNumber());
+        }
+
+        bool sendingAllowed = false;
+        if (pData->allowedSize >= len) {
+            // inside the hard size limit -> send on
+            pData->allowedSize -= len;
+            sendingAllowed = true;
+        }
+
+// ELOG_DEBUG("checkTransport - allowed: %f, desired: %f, size: %i", pData->allowedSize, pData->desiredSize, len);
+
+        if (!pData->hasSentFirstRr) {
+            pData->hasSentFirstRr = true;
+            pData->lastRrSent = now;
+            pData->lastRrSent.tv_sec -= RTCP_MAX_TIME / 2000;
+            char packet[8];
+            packet[0] = 0x80;
+            packet[1] = 0xc9;
+            packet[2] = 0;
+            packet[3] = 0x01;
+            uint32_t *ptr = reinterpret_cast<uint32_t*>(packet + 4);
+            ptr[0] = htonl(getVideoSourceSSRC());
+            deliverFeedback(packet, 8);
+            ELOG_DEBUG("Sending initial RR");
+            logBuffer(packet, 8);
+            //pData->allowedSize = 0;
+            //pData->desiredSize = 0;
+        } else {
+        unsigned int rtcpDt = (now.tv_sec - pData->lastRrSent.tv_sec) * 1000 + (now.tv_usec - pData->lastRrSent.tv_usec) / 1000;
+        if (rtcpDt >= RTCP_MAX_TIME || (pData->requestRr && rtcpDt > RTCP_MIN_TIME)) {
+            // create proper RR if time allows or requires
+            sendReceiverReport(pData);
+        }
+        }
+
+        return sendingAllowed;
+    }
+
+    void WebRtcConnection::sendReceiverReport(struct RtcpData *pData) {
+        ELOG_DEBUG("sendReceiverReport(...)");
+        int packetLen = 32;
+        const int maxPacketLen = 128;
+        uint8_t packet[maxPacketLen];
+        packet[0] = 0x81; // header stuff, fixed
+        packet[1] = 0xc9; // type: RR
+        // 2,3: len 7
+        packet[2] = 0;
+        packet[3] = 7;
+        // 4-7: local ssrc, ignored, will be overwritten
+        packet[4] = 0x89;
+        packet[5] = 0xab;
+        packet[6] = 0xcd;
+        packet[7] = 0xef;
+        uint32_t *ptr = reinterpret_cast<uint32_t*>(packet + 8); // report block 1: ssrc
+        ptr[0] = htonl(pData->ssrc); // 8-11: remote ssrc
+        ptr[0] = htonl(getVideoSourceSSRC());
+
+        float lostPercent = (float)pData->lostPacketCount / (float)pData->packetCount;
+        pData->totalPacketsLost += pData->lostPacketCount;
+
+        pData->lostPacketCount = 0;
+        pData->packetCount = 0;
+
+        ptr[1] = htonl(pData->totalPacketsLost); // 13-15: cumulative packets lost (12-15 used)
+        uint8_t fractionLost = (uint8_t)(lostPercent < 0? 0 : (lostPercent >= 1? 255 : lostPercent * 255));
+        packet[12] = fractionLost; // 12: fraction lost
+
+        ptr[2] = htonl((pData->sequenceCycles << 16) | (pData->sequenceNumber & 0xffff)); // 16-19: ext seq num
+        ptr[3] = htonl(50); // 20-23: jitter
+        ptr[4] = htonl(pData->lastSrTimestamp); // 24-27: last sr
+
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        uint32_t delay = (now.tv_sec - pData->lastSrReception.tv_sec) * 0x10000 + (now.tv_usec - pData->lastSrReception.tv_usec) * 0x1000 / 1000000;
+        ptr[5] = htonl(delay); // 28-31: delay since last sr
+
+
+        // append NACK's
+        if (pData->nackLen > 0) {
+            packet[32] = 0x81; // header stuff
+            packet[33] = 0xcd; // type: PSFTB/NACK
+            // 34,35: len - not yet known, min: 3
+            packet[34] = 0;
+            packet[35] = 3;
+            ptr = reinterpret_cast<uint32_t*>(packet + 36);
+            // 36-39: local ssrc, ignored, will be overwritten
+            ptr[1] = htonl(pData->ssrc); // 40-43: remote ssrc
+            ptr[1] = htonl(getVideoSourceSSRC());
+
+            uint16_t *shortPtr = reinterpret_cast<uint16_t*>(packet+44);
+
+            int count = 0;
+            uint16_t pid = pData->nackList[0];
+            uint16_t blp = 0;
+            const int countLimit = (maxPacketLen - 32 - 12) / 4; // 32: RR, 12: NACK overhead
+            for(int i = 1; i < pData->nackLen; ++i) {
+                uint16_t sqnum = pData->nackList[i];
+                if (sqnum - pid <= 16) {
+                    blp |= 1 << (sqnum - pid);
+                } else {
+                    shortPtr[count * 2 + 0] = htons(pid);
+                    shortPtr[count * 2 + 1] = htons(blp);
+                    if (count >= countLimit) break;
+                    ++count;
+                    pid = sqnum;
+                    blp = 0;
+                }
+            }
+            shortPtr[count * 2 + 0] = htons(pid);
+            shortPtr[count * 2 + 1] = htons(blp);
+
+            uint16_t curLen = 2 + count;
+            shortPtr = reinterpret_cast<uint16_t*>(packet+34);
+            shortPtr[0] = htons(curLen);
+
+            packetLen += (curLen + 1) * 4;
+        }
+
+        ELOG_DEBUG("Generated RTCP");
+        logBuffer((char*)packet, packetLen);
+        deliverFeedback_((char*)packet, packetLen);
+        logBuffer((char*)packet, packetLen);
+        pData->lastRrSent = now;
+    }
 }
 /* namespace erizo */
