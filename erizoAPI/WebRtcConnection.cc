@@ -25,6 +25,7 @@ void WebRtcConnection::Init(Handle<Object> target) {
   tpl->PrototypeTemplate()->Set(String::NewSymbol("setVideoReceiver"), FunctionTemplate::New(setVideoReceiver)->GetFunction());
   tpl->PrototypeTemplate()->Set(String::NewSymbol("getCurrentState"), FunctionTemplate::New(getCurrentState)->GetFunction());
   tpl->PrototypeTemplate()->Set(String::NewSymbol("getStats"), FunctionTemplate::New(getStats)->GetFunction());
+  tpl->PrototypeTemplate()->Set(String::NewSymbol("setRtpVideoBandwidth"), FunctionTemplate::New(setRtpVideoBandwidth)->GetFunction());
 
   Persistent<Function> constructor = Persistent<Function>::New(tpl->GetFunction());
   target->Set(String::NewSymbol("WebRtcConnection"), constructor);
@@ -191,4 +192,18 @@ void WebRtcConnection::statsCallback(uv_async_t *handle, int status){
   Local<Value> args[] = {String::NewSymbol(obj->statsMsg.c_str())};
   if (obj->hasCallback_) 
     obj->statsCallback_->Call(Context::GetCurrent()->Global(), 1, args);
+}
+
+Handle<Value> WebRtcConnection::setRtpVideoBandwidth(const v8::Arguments& args) {
+    HandleScope scope;
+    WebRtcConnection* obj = ObjectWrap::Unwrap<WebRtcConnection>(args.This());
+    int softLimit = 0, hardLimit = 0;
+    if (args.Length() >= 1 && args[0]->IsNumber()) {
+        softLimit = (int)args[0]->NumberValue();
+    }
+    if (args.Length() >= 2 && args[1]->IsNumber()) {
+        hardLimit = (int)args[1]->NumberValue();
+    }
+    obj->me->setRtpVideoBandwidth(softLimit, hardLimit);
+    return scope.Close(Null());
 }

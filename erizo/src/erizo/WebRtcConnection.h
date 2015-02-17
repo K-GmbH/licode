@@ -118,6 +118,12 @@ public:
     int32_t OnReceivedPayloadData(const uint8_t* payloadData, const uint16_t payloadSize,const webrtc::WebRtcRTPHeader* rtpHeader);
     bool OnRecoveredPacket(const uint8_t* packet, int packet_length);
 
+    /**
+     * set the limits for video bandwidth on this connection, soft will not drop packets, hard will drop packets.
+     * set to 0 to ignore the particular value
+     */
+    void setRtpVideoBandwidth(int softLimit, int hardLimit);
+
 private:
   static const int STATS_INTERVAL = 5000;
 	SdpInfo remoteSdp_;
@@ -142,6 +148,8 @@ private:
 	int deliverAudioData_(char* buf, int len);
 	int deliverVideoData_(char* buf, int len);
   int deliverFeedback_(char* buf, int len);
+    // directly queue feedback to proper transport
+    int queueFeedback(char* buf, int len);
 
   // changes the outgoing payload type for in the given data packet
   void changeDeliverPayloadType(dataPacket *dp, packetType type);
@@ -158,22 +166,8 @@ private:
 	boost::condition_variable cond_;
     webrtc::FecReceiverImpl fec_receiver_;
 
-    struct {
-        uint32_t lastSR;
-        uint32_t lastFractionLost:8;
-        uint32_t lastPacketLostCount:24;
-        int currentPacketCount, currentDataCount;
-
-        struct timeval timestamp;
-        float allowedSize;
-        float desiredSize;
-
-        char* tempBuf;
-        int tempLen;
-
-        int jitterEnhancer;
-        uint32_t lastJitter;
-    } rtpDataTracker_;
+    // soft and hard limit for video data on this connection
+    int rtpLimitSoft_, rtpLimitHard_;
 
     struct RtcpData {
         // lost packets - list and length
@@ -201,17 +195,23 @@ private:
         // time based data flow limits
         float allowedSize, desiredSize;
         struct timeval timestamp;
+        // should send pli?
+        bool shouldSendPli;
+        struct timeval lastPliSent;
+
+        // lock for any blocking data change
+        boost::mutex dataLock;
     } rtcpData_;
-    // change the content of Receiver Reports
-    void modifyRtcpRR(char *buf, int len);
-    // measures flow on the connection for receiver reports
-    bool measureRtpFlow(char *buf, int len);
     // simple log output of a buffer
     void logBuffer(char *buf, int len);
 
     void discardPacket(char *buf, int len);
     void checkPacket(char **p_buf, int *p_len);
 
+    // attach a packet number to those nack'd
+    void addNackPacket(uint16_t seqNum, struct RtcpData *pData);
+    // analyze feedback - to integrate information in what should be sent to publisher
+    void analyzeFeedback(char *buf, int len, struct RtcpData *pData);
     // check transport state of this packet, checks for nack listing, etc
     bool checkTransport(char *buf, int len, struct RtcpData *pData);
     // send a receiver report

@@ -16,7 +16,9 @@ namespace erizo {
 
   // time between receiver reports
   const unsigned int RTCP_MAX_TIME = 5000;
-  const unsigned int RTCP_MIN_TIME = 1000;
+  const unsigned int RTCP_MIN_TIME = 100;
+  // time between pli
+  const unsigned int MIN_TIME_BETWEEN_PLI = 3000;
 
   WebRtcConnection::WebRtcConnection(bool audioEnabled, bool videoEnabled, const std::string &stunServer, int stunPort, int minPort, int maxPort)
       : fec_receiver_(this) {
@@ -46,18 +48,12 @@ namespace erizo {
     sending_ = true;
     send_Thread_ = boost::thread(&WebRtcConnection::sendLoop, this);
 
-    rtpDataTracker_.lastSR = 0;
-    rtpDataTracker_.lastFractionLost = 0;
-    rtpDataTracker_.lastPacketLostCount= 0;
-    rtpDataTracker_.currentPacketCount = 0;
-    rtpDataTracker_.currentDataCount = 0;
-    gettimeofday(&rtpDataTracker_.timestamp, NULL);
-    rtpDataTracker_.allowedSize = 0;
-    rtpDataTracker_.jitterEnhancer = 0;
-
     memset((void*)&rtcpData_, 0, sizeof(struct RtcpData));
     gettimeofday(&rtcpData_.timestamp, NULL);
     rtcpData_.timestamp.tv_sec -= 1;
+
+    rtpLimitSoft_ = 0;
+    rtpLimitHard_ = 0;
   }
 
   WebRtcConnection::~WebRtcConnection() {
@@ -206,17 +202,44 @@ namespace erizo {
   int WebRtcConnection::deliverFeedback_(char* buf, int len){
     // Check where to send the feedback
     RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
+    if (chead->isFeedback()) {
+        // don't deliver RR, nor PLI
+        analyzeFeedback(buf, len, &rtcpData_);
+        return len;
+    }
 //    ELOG_DEBUG("received Feedback type %u ssrc %u, sourcessrc %u", chead->packettype, chead->getSSRC(), chead->getSourceSSRC());
+//    ELOG_DEBUG("RTCP-RR: fraction:%u;packets:%u;highestseq:%u/%u;jitter:%u;lastSR:%u", chead->fractionlost, chead->packetlostCount, chead->highestSequenceNumber/0x10000, chead->highestSequenceNumber%0x10000, chead->interarrivalJitter, chead->lastSR, chead->delaySinceLastSR);
+    Transport *p_transport = videoTransport_;
     if (chead->getSourceSSRC() == this->getAudioSourceSSRC()) {
         writeSsrc(buf,len,this->getAudioSinkSSRC());
+        p_transport = audioTransport_;
     } else {
         writeSsrc(buf,len,this->getVideoSinkSSRC());      
     }
 
-    if (videoTransport_ != NULL) {
-      this->queueData(0, buf, len, videoTransport_, OTHER_PACKET);
+    if (p_transport != NULL) {
+      this->queueData(0, buf, len, p_transport, OTHER_PACKET);
     }
     return len;
+  }
+
+  int WebRtcConnection::queueFeedback(char *buf, int len) {
+      // Check where to send the feedback
+      RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
+  //    ELOG_DEBUG("received Feedback type %u ssrc %u, sourcessrc %u", chead->packettype, chead->getSSRC(), chead->getSourceSSRC());
+  //    ELOG_DEBUG("RTCP-RR: fraction:%u;packets:%u;highestseq:%u/%u;jitter:%u;lastSR:%u", chead->fractionlost, chead->packetlostCount, chead->highestSequenceNumber/0x10000, chead->highestSequenceNumber%0x10000, chead->interarrivalJitter, chead->lastSR, chead->delaySinceLastSR);
+      Transport *p_transport = videoTransport_;
+      if (chead->getSourceSSRC() == this->getAudioSourceSSRC()) {
+          writeSsrc(buf,len,this->getAudioSinkSSRC());
+          p_transport = audioTransport_;
+      } else {
+          writeSsrc(buf,len,this->getVideoSinkSSRC());
+      }
+
+      if (p_transport != NULL) {
+        this->queueData(0, buf, len, p_transport, OTHER_PACKET);
+      }
+      return len;
   }
 
   void WebRtcConnection::writeSsrc(char* buf, int len, unsigned int ssrc) {
@@ -262,7 +285,9 @@ namespace erizo {
         // Deliver data
         if (recvSSRC==this->getVideoSourceSSRC() || recvSSRC==this->getVideoSinkSSRC()) {
           parseIncomingPayloadType(buf, len, VIDEO_PACKET);
-          videoSink_->deliverVideoData(buf, len);
+          if (checkTransport(buf, len, &rtcpData_)) {
+            videoSink_->deliverVideoData(buf, len);
+          }
         } else if (recvSSRC==this->getAudioSourceSSRC() || recvSSRC==this->getAudioSinkSSRC()) {
           parseIncomingPayloadType(buf, len, AUDIO_PACKET);
           audioSink_->deliverAudioData(buf, len);
@@ -563,51 +588,6 @@ namespace erizo {
       }
   }
 
-  bool WebRtcConnection::measureRtpFlow(char *buf, int len) {
-      ++rtpDataTracker_.currentPacketCount;
-      rtpDataTracker_.currentDataCount += len;
-//      ELOG_DEBUG("(%p)measureRptFlow => packets: %i; data: %i", (void*)this, rtpDataTracker_.currentPacketCount, rtpDataTracker_.currentDataCount);
-
-      struct timeval now;
-      gettimeofday(&now, NULL);
-      unsigned int dt = (now.tv_sec - rtpDataTracker_.timestamp.tv_sec) * 1000 + (now.tv_usec - rtpDataTracker_.timestamp.tv_usec) / 1000;
-
-
-      // float dataspeed = rtpDataTracker_.currentDataCount / (float) dt;
-      // kB/s = kbit/s / 8
-      float maxspeed = 168.0f / 8.0f;
-      // ELOG_DEBUG("(%p)measureRtpFlow: dataspeed: %f = %i / %i", (void*)this, dataspeed, rtpDataTracker_.currentDataCount, dt);
-      // return dataspeed <= maxspeed;
-
-      rtpDataTracker_.allowedSize += dt * maxspeed;
-      rtpDataTracker_.desiredSize += dt * maxspeed / 2;
-      rtpDataTracker_.timestamp = now;
-      ELOG_DEBUG("allowedSize: %f", rtpDataTracker_.allowedSize);
-      return len <= rtpDataTracker_.allowedSize;
-  }
-
-  void WebRtcConnection::modifyRtcpRR(char *buf, int len) {
-      RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
-      if (chead->packettype == RTCP_Receiver_PT && chead->length > 3) {
-          uint32_t sr = chead->report.receiverReport.lastsr;
-          if (sr > rtpDataTracker_.lastSR) {
-              ELOG_DEBUG("(%p)ModifyRtcpRR: %i", (void*)this, sr);
-              rtpDataTracker_.lastSR = sr;
-              int bonusJitter = rtpDataTracker_.jitterEnhancer;
-              rtpDataTracker_.lastJitter = chead->report.receiverReport.jitter + bonusJitter;
-
-              rtpDataTracker_.jitterEnhancer = 0;
-          }
-          if (sr == rtpDataTracker_.lastSR) {
-              logBuffer(buf, len);
-//              chead->report.receiverReport.fractionlost = rtpDataTracker_.lastFractionLost;
-//              chead->report.receiverReport.lost = rtpDataTracker_.lastPacketLostCount;
-              chead->report.receiverReport.jitter = rtpDataTracker_.lastJitter;
-              logBuffer(buf, len);
-          }
-      }
-  }
-
   void WebRtcConnection::logBuffer(char *buf, int len)
     {
         char hex[] = "0123456789abcdefghjklmn";
@@ -623,39 +603,91 @@ namespace erizo {
         delete[] logstr;
     }
 
-    void WebRtcConnection::discardPacket(char *buf, int len) {
-        if (rtpDataTracker_.tempBuf != NULL) {
-            delete[] rtpDataTracker_.tempBuf;
+    void WebRtcConnection::analyzeFeedback(char *buf, int len, RtcpData *pData) {
+        if (pData == NULL) {
+            return;
         }
-        rtpDataTracker_.tempBuf = new char[len];
-        rtpDataTracker_.tempLen = len;
-        memcpy((void*)rtpDataTracker_.tempBuf, (void*)buf, len);
+        RtcpHeader *chead = reinterpret_cast<RtcpHeader*>(buf);
+        if (chead->isFeedback()) {
+            char* movingBuf = buf;
+            int rtcpLength = 0;
+            int totalLength = 0;
+            do {
+                movingBuf+=rtcpLength;
+                chead = reinterpret_cast<RtcpHeader*>(movingBuf);
+                rtcpLength = (ntohs(chead->length)+1) * 4;
+                totalLength += rtcpLength;
+                if (chead->packettype == RTCP_PS_Feedback_PT) {
+                    if (chead->blockcount == 1 || chead->blockcount == 4) {
+                        // 1: PLI, 4: FIR
+                        pData->shouldSendPli = true;
+                        pData->requestRr = true;
+                        ELOG_DEBUG("FeedbackPT: PLI desired!");
+                    } else {
+                        ELOG_DEBUG("FeedbackPT: %u", chead->blockcount);
+                        logBuffer(buf, len);
+                    }
+                } else if (chead->packettype == RTCP_RTP_Feedback_PT) {
+                    // NACK packet!
+                    int len = chead->getLength() - 2;
+                    for (int k = 0; k < len; ++k) {
+                        uint16_t seqNum = ntohs(*((uint16_t*)(movingBuf + 12 + k * 4)));
+                        addNackPacket(seqNum, pData);
+                        uint16_t blp = ntohs(*((uint16_t*)(movingBuf + 14 + k * 4)));
+                        ELOG_DEBUG("FeedbackPT: NACK %x - and: %x", seqNum, blp);
+                        uint16_t bitmask = 1;
+                        for (int i = 0; i < 16; ++i) {
+                            if ((blp & bitmask) != 0) {
+                                addNackPacket(seqNum + i, pData);
+                            }
+                            bitmask *= 2;
+                        }
+                    }
+                }
+            } while (totalLength < len);
+        }
     }
 
-    void WebRtcConnection::checkPacket(char **p_buf, int *p_len) {
-        if (rtpDataTracker_.tempBuf != NULL) {
-            char* buf = rtpDataTracker_.tempBuf;
-            int len = rtpDataTracker_.tempLen;
-
-            rtpDataTracker_.tempBuf = NULL;
-            discardPacket(*p_buf, *p_len);
-
-            *p_buf = buf;
-            *p_len = len;
+    void WebRtcConnection::addNackPacket(uint16_t seqNum, struct RtcpData *pData) {
+        boost::mutex::scoped_lock lock(pData->dataLock);
+        int insertPos = 0;
+        for (int i = 0; i < pData->nackLen; ++i) {
+            if (pData->nackList[i] == seqNum) {
+                return;
+            } else if (pData->nackList[i] > seqNum) {
+                insertPos = i;
+                break;
+            }
         }
+
+        uint32_t *nackBuf = new uint32_t[pData->nackLen + 1];
+
+        if (pData->nackLen > 0) {
+            memcpy(nackBuf, pData->nackList, insertPos * sizeof(uint32_t)); //pData->nackLen * sizeof(uint32_t));
+            memcpy(nackBuf + insertPos + 1, pData->nackList + insertPos, (pData->nackLen - insertPos) * sizeof(uint32_t));
+            nackBuf[insertPos] = seqNum;
+            delete[] pData->nackList;
+        } else {
+            nackBuf[pData->nackLen] = seqNum;
+        }
+        pData->nackLen += 1;
+        pData->nackList = nackBuf;
+        pData->requestRr = true;
     }
 
     bool WebRtcConnection::checkTransport(char *buf, int len, struct RtcpData *pData) {
-        // kB/s = kbit/s / 8
-        const float maxspeed = 86.0f / 8.0f;//25;//12.5f;
-
         struct timeval now;
         gettimeofday(&now, NULL);
         unsigned int dt = (now.tv_sec - pData->timestamp.tv_sec) * 1000 + (now.tv_usec - pData->timestamp.tv_usec) / 1000;
-if (pData->timestamp.tv_sec != 0) {        
-        pData->allowedSize += dt * maxspeed * 2;
-        pData->desiredSize += dt * maxspeed;
-}
+        if (pData->timestamp.tv_sec != 0) {
+            pData->allowedSize += dt * rtpLimitHard_;
+            pData->desiredSize += dt * rtpLimitSoft_;
+            // size memory - at max 500 milliseconds
+            const float maxHard = rtpLimitHard_ * 500;
+            const float maxSoft = rtpLimitSoft_ * 500;
+            if (pData->allowedSize > maxHard) pData->allowedSize = maxHard;
+            if (pData->desiredSize > maxSoft) pData->desiredSize = maxSoft;
+        }
         pData->timestamp = now;
 
         RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
@@ -673,44 +705,41 @@ if (pData->timestamp.tv_sec != 0) {
         RtpHeader *head = reinterpret_cast<RtpHeader*>(buf);
         ++pData->packetCount;
 
-        // nack list check
-        for (int i = 0; i < pData->nackLen; ++i) {
-            if (pData->nackList[i] == head->getSeqNumber()) {
-                ELOG_DEBUG("Received NACK'd packet: %x", head->getSeqNumber());
-                // nack'd? Remove from list and don't send on
-                if (pData->nackLen == 1) {
-                    pData->nackList = NULL;
-                    pData->nackLen  = 0;
-                    pData->requestRr = false;
-                } else {
-                    uint32_t *nackBuf = new uint32_t[pData->nackLen];
-                    memcpy(nackBuf, pData->nackList, i * sizeof(uint32_t));
-                    memcpy(nackBuf + i, pData->nackList + i + 1, (pData->nackLen - i - 1) * sizeof(uint32_t));
-                    delete[] pData->nackList;
-                    pData->nackLen = pData->nackLen - 1;
-                    pData->nackList = nackBuf;
+        {
+            boost::mutex::scoped_lock lock(pData->dataLock);
+
+            // nack list check
+            for (int i = 0; i < pData->nackLen; ++i) {
+                if (pData->nackList[i] == head->getSeqNumber()) {
+                    ELOG_DEBUG("Received NACK'd packet: %x", head->getSeqNumber());
+                    // nack'd? Remove from list and don't send on
+                    if (pData->nackLen == 1) {
+                        pData->nackList = NULL;
+                        pData->nackLen  = 0;
+                        pData->requestRr = pData->shouldSendPli;
+                    } else {
+                        uint32_t *nackBuf = new uint32_t[pData->nackLen];
+                        memcpy(nackBuf, pData->nackList, i * sizeof(uint32_t));
+                        memcpy(nackBuf + i, pData->nackList + i + 1, (pData->nackLen - i - 1) * sizeof(uint32_t));
+                        delete[] pData->nackList;
+                        pData->nackLen = pData->nackLen - 1;
+                        pData->nackList = nackBuf;
+                    }
+                    return true;
                 }
-                return false;
             }
         }
 
-        if (pData->desiredSize < len) {
+        if (pData->desiredSize < len && rtpLimitSoft_ > 0) {
             ELOG_DEBUG("pretending to drop %x - len: %i vs %f", head->getSeqNumber(), len, pData->desiredSize);
             ++pData->lostPacketCount;
 
             // above what we want to send? remember for nack'ing
-            uint32_t *nackBuf = new uint32_t[pData->nackLen + 1];
-
-            if (pData->nackLen > 0) {
-                memcpy(nackBuf, pData->nackList, pData->nackLen * sizeof(uint32_t));
-            }
-            nackBuf[pData->nackLen] = head->getSeqNumber();
-            delete[] pData->nackList;
-            pData->nackLen += 1;
-            pData->nackList = nackBuf;
+            addNackPacket(head->getSeqNumber(), pData);
 
             pData->requestRr = true;
         } else {
+            // TODO: recognize missing packets?! problem: order of packets not safe
             pData->desiredSize -= len;
             if (head->getSeqNumber() < pData->sequenceNumber) {
                 ++pData->sequenceCycles;
@@ -722,7 +751,7 @@ if (pData->timestamp.tv_sec != 0) {
         }
 
         bool sendingAllowed = false;
-        if (pData->allowedSize >= len) {
+        if (pData->allowedSize >= len || rtpLimitHard_ <= 0) {
             // inside the hard size limit -> send on
             pData->allowedSize -= len;
             sendingAllowed = true;
@@ -741,23 +770,25 @@ if (pData->timestamp.tv_sec != 0) {
             packet[3] = 0x01;
             uint32_t *ptr = reinterpret_cast<uint32_t*>(packet + 4);
             ptr[0] = htonl(getVideoSourceSSRC());
-            deliverFeedback(packet, 8);
+            queueFeedback(packet, 8);
             ELOG_DEBUG("Sending initial RR");
             logBuffer(packet, 8);
             //pData->allowedSize = 0;
             //pData->desiredSize = 0;
         } else {
-        unsigned int rtcpDt = (now.tv_sec - pData->lastRrSent.tv_sec) * 1000 + (now.tv_usec - pData->lastRrSent.tv_usec) / 1000;
-        if (rtcpDt >= RTCP_MAX_TIME || (pData->requestRr && rtcpDt > RTCP_MIN_TIME)) {
-            // create proper RR if time allows or requires
-            sendReceiverReport(pData);
-        }
+            unsigned int rtcpDt = (now.tv_sec - pData->lastRrSent.tv_sec) * 1000 + (now.tv_usec - pData->lastRrSent.tv_usec) / 1000;
+            if (rtcpDt >= RTCP_MAX_TIME || (pData->requestRr && rtcpDt > RTCP_MIN_TIME)) {
+                // create proper RR if time allows or requires
+                sendReceiverReport(pData);
+            }
         }
 
         return sendingAllowed;
     }
 
     void WebRtcConnection::sendReceiverReport(struct RtcpData *pData) {
+        boost::mutex::scoped_lock lock(pData->dataLock);
+
         ELOG_DEBUG("sendReceiverReport(...)");
         int packetLen = 32;
         const int maxPacketLen = 128;
@@ -795,25 +826,49 @@ if (pData->timestamp.tv_sec != 0) {
         uint32_t delay = (now.tv_sec - pData->lastSrReception.tv_sec) * 0x10000 + (now.tv_usec - pData->lastSrReception.tv_usec) * 0x1000 / 1000000;
         ptr[5] = htonl(delay); // 28-31: delay since last sr
 
+        // attach PLI - if desired
+        uint32_t timeSinceLastPli = (now.tv_sec - pData->lastPliSent.tv_sec) * 0x10000 + (now.tv_usec - pData->lastPliSent.tv_usec) * 0x1000 / 1000000;
+        if (pData->shouldSendPli && timeSinceLastPli > MIN_TIME_BETWEEN_PLI) {
+            if (packetLen + 12 < maxPacketLen) {
+                pData->shouldSendPli = false;
+                pData->lastPliSent = now;
+
+                packet[packetLen + 0] = 0x81; // header stuff
+                packet[packetLen + 1] = 0xce; // type: RTPFB/PLI
+                // 34,35: len - not yet known, exactly: 2
+                packet[packetLen + 2] = 0;
+                packet[packetLen + 3] = 2;
+                ptr = reinterpret_cast<uint32_t*>(packet + packetLen + 4);
+                // 36-39: local ssrc, ignored, will be overwritten
+                ptr[1] = htonl(pData->ssrc); // 40-43: remote ssrc
+                ptr[1] = htonl(getVideoSourceSSRC());
+
+                packetLen += 3 * 4;
+
+                // also clear all NACKs, if requesting PLI
+                pData->nackList = NULL;
+                pData->nackLen  = 0;
+            }
+        }
 
         // append NACK's
         if (pData->nackLen > 0) {
-            packet[32] = 0x81; // header stuff
-            packet[33] = 0xcd; // type: PSFTB/NACK
+            packet[packetLen + 0] = 0x81; // header stuff
+            packet[packetLen + 1] = 0xcd; // type: PSFTB/NACK
             // 34,35: len - not yet known, min: 3
-            packet[34] = 0;
-            packet[35] = 3;
-            ptr = reinterpret_cast<uint32_t*>(packet + 36);
+            packet[packetLen + 2] = 0;
+            packet[packetLen + 3] = 3;
+            ptr = reinterpret_cast<uint32_t*>(packet + packetLen + 4);
             // 36-39: local ssrc, ignored, will be overwritten
             ptr[1] = htonl(pData->ssrc); // 40-43: remote ssrc
             ptr[1] = htonl(getVideoSourceSSRC());
 
-            uint16_t *shortPtr = reinterpret_cast<uint16_t*>(packet+44);
+            uint16_t *shortPtr = reinterpret_cast<uint16_t*>(packet+ packetLen + 12);
 
             int count = 0;
             uint16_t pid = pData->nackList[0];
             uint16_t blp = 0;
-            const int countLimit = (maxPacketLen - 32 - 12) / 4; // 32: RR, 12: NACK overhead
+            const int countLimit = (maxPacketLen - packetLen - 12) / 4; // 32: RR, 12: NACK overhead
             for(int i = 1; i < pData->nackLen; ++i) {
                 uint16_t sqnum = pData->nackList[i];
                 if (sqnum - pid <= 16) {
@@ -829,19 +884,27 @@ if (pData->timestamp.tv_sec != 0) {
             }
             shortPtr[count * 2 + 0] = htons(pid);
             shortPtr[count * 2 + 1] = htons(blp);
+            ++count;
 
             uint16_t curLen = 2 + count;
-            shortPtr = reinterpret_cast<uint16_t*>(packet+34);
+            shortPtr = reinterpret_cast<uint16_t*>(packet+ packetLen + 2);
             shortPtr[0] = htons(curLen);
 
             packetLen += (curLen + 1) * 4;
         }
 
+
         ELOG_DEBUG("Generated RTCP");
         logBuffer((char*)packet, packetLen);
-        deliverFeedback_((char*)packet, packetLen);
+        queueFeedback((char*)packet, packetLen);
         logBuffer((char*)packet, packetLen);
         pData->lastRrSent = now;
+    }
+
+    void WebRtcConnection::setRtpVideoBandwidth(int softLimit, int hardLimit) {
+        // transform from kbit/s to kByte/s
+        rtpLimitSoft_ = softLimit / 8.0f;
+        rtpLimitHard_ = hardLimit / 8.0f;
     }
 }
 /* namespace erizo */

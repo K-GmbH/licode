@@ -77,7 +77,16 @@ class WebRtcConnection : public node::ObjectWrap, erizo::WebRtcConnectionEventLi
 
 
   static v8::Handle<v8::Value> getStats(const v8::Arguments& args);
-  
+
+  /*
+   * Sets the soft limit for video bandwidth - in kbit/s. The connection
+   * will reduce any incoming traffic to the provided soft limit. It will
+   * also discard any packet above the provided hard limit.
+   * Param: the soft bandwidth limit (as integer)
+   * Param: the hard bandwidth limit (as integer)
+   */
+  static v8::Handle<v8::Value> setRtpVideoBandwidth(const v8::Arguments& args);
+
   static void eventsCallback(uv_async_t *handle, int status);
   static void statsCallback(uv_async_t *handle, int status);
  
