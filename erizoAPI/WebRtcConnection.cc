@@ -207,3 +207,14 @@ Handle<Value> WebRtcConnection::setRtpVideoBandwidth(const v8::Arguments& args) 
     obj->me->setRtpVideoBandwidth(softLimit, hardLimit);
     return scope.Close(Null());
 }
+
+Handle<Value> WebRtcConnection::setRtcpFeedbackParsing(const v8::Arguments& args) {
+    HandleScope scope;
+    WebRtcConnection* obj = ObjectWrap::Unwrap<WebRtcConnection>(args.This());
+    bool parseFeedback = false;
+    if (args.Length() >= 1) {
+        parseFeedback = args[0]->BooleanValue();
+    }
+    obj->me->setRtcpFeedbackParsing(parseFeedback);
+    return scope.Close(Null());
+}

@@ -9,6 +9,7 @@
 namespace erizo{
 
 class NiceConnection;
+class MediaSink;
 
 enum packetType{
     VIDEO_PACKET,
@@ -34,8 +35,14 @@ public:
     int deliverFeedback(char* buf, int len){
         return this->deliverFeedback_(buf,len);
     }
+    int deliverFeedbackReply(char*buf, int len, MediaSink* pReplyChannel) {
+        return this->deliverFeedbackReply_(buf, len, pReplyChannel);
+    }
 private:
     virtual int deliverFeedback_(char* buf, int len)=0;
+    virtual int deliverFeedbackReply_(char *buf, int len, MediaSink *pReplyChannel) {
+        return this->deliverFeedback_(buf, len);
+    }
 };
 
 

@@ -54,10 +54,21 @@ namespace erizo {
 
     rtpLimitSoft_ = 0;
     rtpLimitHard_ = 0;
+
+    rtpPacketMemory_ = boost::circular_buffer<RtpPacketBuffer>(512);
+    parseRrFeedback_ = false;
   }
 
   WebRtcConnection::~WebRtcConnection() {
     ELOG_INFO("WebRtcConnection Destructor");
+    {
+        boost::mutex::scoped_lock lock(rtcpData_.dataLock);
+        if (rtcpData_.nackList != NULL) {
+            delete[] rtcpData_.nackList;
+            rtcpData_.nackList = NULL;
+            rtcpData_.nackLen = 0;
+        }
+    }
     sending_ = false;
     cond_.notify_one();
     send_Thread_.join();
@@ -201,12 +212,7 @@ namespace erizo {
 
   int WebRtcConnection::deliverFeedback_(char* buf, int len){
     // Check where to send the feedback
-    RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
-    if (chead->isFeedback()) {
-        // don't deliver RR, nor PLI
-        analyzeFeedback(buf, len, &rtcpData_);
-        return len;
-    }
+      RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
 //    ELOG_DEBUG("received Feedback type %u ssrc %u, sourcessrc %u", chead->packettype, chead->getSSRC(), chead->getSourceSSRC());
 //    ELOG_DEBUG("RTCP-RR: fraction:%u;packets:%u;highestseq:%u/%u;jitter:%u;lastSR:%u", chead->fractionlost, chead->packetlostCount, chead->highestSequenceNumber/0x10000, chead->highestSequenceNumber%0x10000, chead->interarrivalJitter, chead->lastSR, chead->delaySinceLastSR);
     Transport *p_transport = videoTransport_;
@@ -221,6 +227,18 @@ namespace erizo {
       this->queueData(0, buf, len, p_transport, OTHER_PACKET);
     }
     return len;
+  }
+
+  int WebRtcConnection::deliverFeedbackReply_(char *buf, int len, MediaSink *pReplyChannel) {
+      if (parseRrFeedback_) {
+          RtcpHeader *chead = reinterpret_cast<RtcpHeader*> (buf);
+          if (chead->isFeedback()) {
+              // don't deliver RR, nor PLI
+              analyzeFeedback(buf, len, &rtcpData_, pReplyChannel);
+              return len;
+          }
+      }
+      return deliverFeedback_(buf, len);
   }
 
   int WebRtcConnection::queueFeedback(char *buf, int len) {
@@ -268,7 +286,7 @@ namespace erizo {
     // DELIVER FEEDBACK (RR, FEEDBACK PACKETS)
     if (chead->isFeedback()){
       if (fbSink_ != NULL) {
-        fbSink_->deliverFeedback(buf,len);
+        fbSink_->deliverFeedbackReply(buf,len, videoSink_);
       }
     } else {
       // RTP or RTCP Sender Report
@@ -603,7 +621,7 @@ namespace erizo {
         delete[] logstr;
     }
 
-    void WebRtcConnection::analyzeFeedback(char *buf, int len, RtcpData *pData) {
+    void WebRtcConnection::analyzeFeedback(char *buf, int len, RtcpData *pData, MediaSink *pMediaSink) {
         if (pData == NULL) {
             return;
         }
@@ -622,10 +640,10 @@ namespace erizo {
                         // 1: PLI, 4: FIR
                         pData->shouldSendPli = true;
                         pData->requestRr = true;
-                        ELOG_DEBUG("FeedbackPT: PLI desired!");
+                        ELOG_INFO("FeedbackPT: PLI desired!");
                     } else {
-                        ELOG_DEBUG("FeedbackPT: %u", chead->blockcount);
-                        logBuffer(buf, len);
+                        //ELOG_DEBUG("FeedbackPT: %u", chead->blockcount);
+                        //logBuffer(buf, len);
                     }
                 } else if (chead->packettype == RTCP_RTP_Feedback_PT) {
                     // NACK packet!
@@ -638,7 +656,28 @@ namespace erizo {
                         uint16_t bitmask = 1;
                         for (int i = 0; i < 16; ++i) {
                             if ((blp & bitmask) != 0) {
-                                addNackPacket(seqNum + i, pData);
+                                boost::mutex::scoped_lock lock(rtpPacketLock_);
+                                int cur = seqNum + i;
+                                bool resent = false;
+                                if (pMediaSink != NULL && rtpPacketMemory_.size() > 0) {
+                                    int diff = rtpPacketMemory_.at(0).seqNumber - cur;
+                                    if (diff > 0x7fff) {
+                                        diff -= 0x10000;
+                                    } else if (diff < 0) {
+                                        diff += 0x10000;
+                                    }
+                                    if (0 <= diff && diff < rtpPacketMemory_.size()) {
+                                        if (rtpPacketMemory_[diff].isSet() && rtpPacketMemory_[diff].seqNumber == (uint16_t)cur) {
+                                            resent = true;
+                                            pMediaSink->deliverVideoData(rtpPacketMemory_[diff].buf, rtpPacketMemory_[diff].len);
+                                        }
+                                    }
+                                    ELOG_DEBUG("resent (%i) packet %x - diff: %i", resent, cur, diff);
+                                }
+
+                                if (!resent) {
+                                    addNackPacket(seqNum + i, pData);
+                                }
                             }
                             bitmask *= 2;
                         }
@@ -650,7 +689,7 @@ namespace erizo {
 
     void WebRtcConnection::addNackPacket(uint16_t seqNum, struct RtcpData *pData) {
         boost::mutex::scoped_lock lock(pData->dataLock);
-        int insertPos = 0;
+        int insertPos = pData->nackLen;
         for (int i = 0; i < pData->nackLen; ++i) {
             if (pData->nackList[i] == seqNum) {
                 return;
@@ -664,7 +703,9 @@ namespace erizo {
 
         if (pData->nackLen > 0) {
             memcpy(nackBuf, pData->nackList, insertPos * sizeof(uint32_t)); //pData->nackLen * sizeof(uint32_t));
-            memcpy(nackBuf + insertPos + 1, pData->nackList + insertPos, (pData->nackLen - insertPos) * sizeof(uint32_t));
+            if (insertPos < pData->nackLen) {
+                memcpy(nackBuf + insertPos + 1, pData->nackList + insertPos, (pData->nackLen - insertPos) * sizeof(uint32_t));
+            }
             nackBuf[insertPos] = seqNum;
             delete[] pData->nackList;
         } else {
@@ -694,12 +735,14 @@ namespace erizo {
         if (chead->packettype == RTCP_Sender_PT) {
             pData->lastSrReception = now;
             pData->lastSrTimestamp = (uint32_t)(chead->report.senderReport.ntptimestamp >> 16);
-            ELOG_DEBUG("analysed SR - ntp timestamp: %x", pData->lastSrTimestamp);
+            ELOG_INFO("analysed SR - ntp timestamp: %x", pData->lastSrTimestamp);
             return true;
         } else if (chead->isRtcp()) {
             // unrecognized rtcp packet - ignore and send on
             return true;
         }
+
+        storeRtpPacket(buf, len);
 
         // this is an rtp packet
         RtpHeader *head = reinterpret_cast<RtpHeader*>(buf);
@@ -711,16 +754,21 @@ namespace erizo {
             // nack list check
             for (int i = 0; i < pData->nackLen; ++i) {
                 if (pData->nackList[i] == head->getSeqNumber()) {
-                    ELOG_DEBUG("Received NACK'd packet: %x", head->getSeqNumber());
+                    ELOG_INFO("Received NACK'd packet: %x", head->getSeqNumber());
                     // nack'd? Remove from list and don't send on
                     if (pData->nackLen == 1) {
+                        if (pData->nackList != NULL) {
+                            delete[] pData->nackList;
+                        }
                         pData->nackList = NULL;
                         pData->nackLen  = 0;
                         pData->requestRr = pData->shouldSendPli;
                     } else {
                         uint32_t *nackBuf = new uint32_t[pData->nackLen];
                         memcpy(nackBuf, pData->nackList, i * sizeof(uint32_t));
-                        memcpy(nackBuf + i, pData->nackList + i + 1, (pData->nackLen - i - 1) * sizeof(uint32_t));
+                        if (i + 1 < pData->nackLen) {
+                            memcpy(nackBuf + i, pData->nackList + i + 1, (pData->nackLen - i - 1) * sizeof(uint32_t));
+                        }
                         delete[] pData->nackList;
                         pData->nackLen = pData->nackLen - 1;
                         pData->nackList = nackBuf;
@@ -731,7 +779,7 @@ namespace erizo {
         }
 
         if (pData->desiredSize < len && rtpLimitSoft_ > 0) {
-            ELOG_DEBUG("pretending to drop %x - len: %i vs %f", head->getSeqNumber(), len, pData->desiredSize);
+            ELOG_INFO("pretending to drop %x - len: %i vs %f", head->getSeqNumber(), len, pData->desiredSize);
             ++pData->lostPacketCount;
 
             // above what we want to send? remember for nack'ing
@@ -742,6 +790,7 @@ namespace erizo {
             // TODO: recognize missing packets?! problem: order of packets not safe
             pData->desiredSize -= len;
             if (head->getSeqNumber() < pData->sequenceNumber) {
+                // too simple? maybe
                 ++pData->sequenceCycles;
             }
             pData->sequenceNumber = head->getSeqNumber();
@@ -846,6 +895,9 @@ namespace erizo {
                 packetLen += 3 * 4;
 
                 // also clear all NACKs, if requesting PLI
+                if (pData->nackList != NULL) {
+                    delete[] pData->nackList;
+                }
                 pData->nackList = NULL;
                 pData->nackLen  = 0;
             }
@@ -894,10 +946,10 @@ namespace erizo {
         }
 
 
-        ELOG_DEBUG("Generated RTCP");
-        logBuffer((char*)packet, packetLen);
+        ELOG_INFO("Generated RTCP");
+        //logBuffer((char*)packet, packetLen);
         queueFeedback((char*)packet, packetLen);
-        logBuffer((char*)packet, packetLen);
+        //logBuffer((char*)packet, packetLen);
         pData->lastRrSent = now;
     }
 
@@ -905,6 +957,61 @@ namespace erizo {
         // transform from kbit/s to kByte/s
         rtpLimitSoft_ = softLimit / 8.0f;
         rtpLimitHard_ = hardLimit / 8.0f;
+
+        // grant 500 milliseconds in data allowance
+        rtcpData_.allowedSize += 500 * rtpLimitHard_;
+        rtcpData_.desiredSize += 500 * rtpLimitSoft_;
+    }
+
+    void WebRtcConnection::storeRtpPacket(char *buf, int len) {
+        if (!parseRrFeedback_) {
+            return;
+        }
+        boost::mutex::scoped_lock lock(rtpPacketLock_);
+        uint16_t currentSqNum = ntohs(*(uint16_t*)(buf + 2));
+        int diff = 1;
+        if (rtpPacketMemory_.size() > 0) {
+            uint16_t oldSqNum = rtpPacketMemory_.at(0).seqNumber;
+            diff = (int)currentSqNum - (int)oldSqNum;
+
+            // check full swap
+            if (diff < -0x7fff) {
+                ELOG_DEBUG("storeRtpPacket - SWAP! %x -> %x", oldSqNum, currentSqNum);
+                diff += 0x10000;
+            } else if (diff > 0x7fff) {
+                diff -= 0x10000;
+            }
+        }
+        // ELOG_DEBUG("storeRtpPacket - diff: %i (%x)", diff, currentSqNum);
+        if (diff == 1) {
+            // normal case - just insert next packet
+            RtpPacketBuffer currentMemory;
+            rtpPacketMemory_.push_front(currentMemory);
+            rtpPacketMemory_[0].set(buf, len);
+        } else if (diff <= 0) {
+            // replace in existing memory
+            int index = -diff;
+            if (index < rtpPacketMemory_.size()) {
+                rtpPacketMemory_.at(index).set(buf, len);
+            }
+        } else if (diff > 1) {
+            // insert empty packets, add NACKs
+            uint16_t oldSqNum = rtpPacketMemory_.at(0).seqNumber;
+            for (int i = 0; i < diff - 1; ++i) {
+                uint16_t sqNum = oldSqNum + i;
+                RtpPacketBuffer fakeMem;
+                fakeMem.seqNumber = sqNum;
+                rtpPacketMemory_.push_front(fakeMem);
+                // addNackPacket(sqNum, &rtcpData_);
+            }
+            RtpPacketBuffer currentMemory;
+            rtpPacketMemory_.push_front(currentMemory);
+            rtpPacketMemory_[0].set(buf, len);
+        }
+    }
+
+    void WebRtcConnection::setRtcpFeedbackParsing(bool flag) {
+        parseRrFeedback_ = flag;
     }
 }
 /* namespace erizo */

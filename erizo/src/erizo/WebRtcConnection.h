@@ -5,6 +5,7 @@
 #include <queue>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread.hpp>
+#include <boost/circular_buffer.hpp>
 #include <sys/time.h>
 
 #include "logger.h"
@@ -25,6 +26,41 @@ class TransportListener;
 enum WebRTCEvent {
   CONN_INITIAL = 101, CONN_STARTED = 102, CONN_READY = 103, CONN_FINISHED = 104, 
   CONN_FAILED = 500
+};
+
+// helper struct to keep track of limited number of rtp packets
+struct RtpPacketBuffer {
+    char* buf;
+    int len;
+    uint16_t seqNumber;
+
+    RtpPacketBuffer() {
+        this->buf = 0;
+        this->len = 0;
+        this->seqNumber = 0;
+    }
+
+    void set(char *buf, int len) {
+        if (buf) {
+            delete[] this->buf;
+        }
+        this->buf = new char[len];
+        memcpy(this->buf, buf, len);
+        this->len = len;
+
+        seqNumber = ntohs(*(short*)(buf + 2));
+    }
+
+    bool isSet() const {
+        return this->len > 0;
+    }
+
+    ~RtpPacketBuffer() {
+        if (buf) {
+            delete[] buf;
+            buf = 0;
+        }
+    }
 };
 
 class WebRtcConnectionEventListener {
@@ -124,6 +160,12 @@ public:
      */
     void setRtpVideoBandwidth(int softLimit, int hardLimit);
 
+    /**
+     * @brief setRtcpFeedbackParsing turns parsing of rtcp rr feedback on or off
+     * @param flag
+     */
+    void setRtcpFeedbackParsing(bool flag);
+
 private:
   static const int STATS_INTERVAL = 5000;
 	SdpInfo remoteSdp_;
@@ -148,6 +190,7 @@ private:
 	int deliverAudioData_(char* buf, int len);
 	int deliverVideoData_(char* buf, int len);
   int deliverFeedback_(char* buf, int len);
+    int deliverFeedbackReply_(char *buf, int len, MediaSink *pReplyChannel);
     // directly queue feedback to proper transport
     int queueFeedback(char* buf, int len);
 
@@ -205,17 +248,24 @@ private:
     // simple log output of a buffer
     void logBuffer(char *buf, int len);
 
-    void discardPacket(char *buf, int len);
-    void checkPacket(char **p_buf, int *p_len);
-
     // attach a packet number to those nack'd
     void addNackPacket(uint16_t seqNum, struct RtcpData *pData);
     // analyze feedback - to integrate information in what should be sent to publisher
-    void analyzeFeedback(char *buf, int len, struct RtcpData *pData);
+    void analyzeFeedback(char *buf, int len, struct RtcpData *pData, MediaSink *pMediaSink);
     // check transport state of this packet, checks for nack listing, etc
     bool checkTransport(char *buf, int len, struct RtcpData *pData);
     // send a receiver report
     void sendReceiverReport(struct RtcpData *pData);
+
+    // lock to prevent async issues with packet memory
+    boost::mutex rtpPacketLock_;
+    // limited memory for rtp packets
+    boost::circular_buffer<RtpPacketBuffer> rtpPacketMemory_;
+    // flag - whether or not to read and understand incoming rr
+    bool parseRrFeedback_;
+
+    // remembers an rtp packet for later use, potentially adds nack info
+    void storeRtpPacket(char *buf, int len);
 };
 
 } /* namespace erizo */

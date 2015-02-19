@@ -87,6 +87,13 @@ class WebRtcConnection : public node::ObjectWrap, erizo::WebRtcConnectionEventLi
    */
   static v8::Handle<v8::Value> setRtpVideoBandwidth(const v8::Arguments& args);
 
+  /*
+   * Sets if rtcp feedback channel should be read and parsed by the server
+   * (param: true) or passed on to the publishers without any work (param: false)
+   * Param: flag to turn parsing on or off
+   */
+  static v8::Handle<v8::Value> setRtcpFeedbackParsing(const v8::Arguments& args);
+
   static void eventsCallback(uv_async_t *handle, int status);
   static void statsCallback(uv_async_t *handle, int status);
  
