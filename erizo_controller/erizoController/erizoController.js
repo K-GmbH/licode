@@ -15,6 +15,8 @@ GLOBAL.config.erizoController = GLOBAL.config.erizoController || {};
 GLOBAL.config.erizoController.stunServerUrl = GLOBAL.config.erizoController.stunServerUrl || 'stun:stun.l.google.com:19302';
 GLOBAL.config.erizoController.defaultVideoBW = GLOBAL.config.erizoController.defaultVideoBW || 300;
 GLOBAL.config.erizoController.maxVideoBW = GLOBAL.config.erizoController.maxVideoBW || 300;
+GLOBAL.config.erizoController.defaultAudioBW = GLOBAL.config.erizoController.defaultAudioBW || 64;
+GLOBAL.config.erizoController.maxAudioBW = GLOBAL.config.erizoController.maxAudioBW || 64;
 GLOBAL.config.erizoController.publicIP = GLOBAL.config.erizoController.publicIP || '';
 GLOBAL.config.erizoController.hostname = GLOBAL.config.erizoController.hostname|| '';
 GLOBAL.config.erizoController.port = GLOBAL.config.erizoController.port || 8080;
@@ -372,6 +374,8 @@ var listen = function () {
                                             p2p: socket.room.p2p,
                                             defaultVideoBW: GLOBAL.config.erizoController.defaultVideoBW,
                                             maxVideoBW: GLOBAL.config.erizoController.maxVideoBW,
+                                            defaultAudioBW: GLOBAL.config.erizoController.defaultAudioBW,
+                                            maxAudioBW: GLOBAL.config.erizoController.maxAudioBW,
                                             stunServerUrl: GLOBAL.config.erizoController.stunServerUrl,
                                             turnServer: GLOBAL.config.erizoController.turnServer
                                             });

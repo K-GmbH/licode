@@ -283,6 +283,8 @@ Erizo.Room = function (spec) {
             that.state = CONNECTED;
             spec.defaultVideoBW = response.defaultVideoBW;
             spec.maxVideoBW = response.maxVideoBW;
+            spec.defaultAudioBW = response.defaultAudioBW;
+            spec.maxAudioBW = response.maxAudioBW;
 
             // 2- Retrieve list of streams
             for (index in streams) {
@@ -318,10 +320,13 @@ Erizo.Room = function (spec) {
     that.publish = function (stream, options, callback) {
         options = options || {};
 
-        var maxVideoBW;
         options.maxVideoBW = options.maxVideoBW || spec.defaultVideoBW;
         if (options.maxVideoBW > spec.maxVideoBW) {
             options.maxVideoBW = spec.maxVideoBW;
+        }
+        options.maxAudioBW = options.maxAudioBW || spec.defaultAudioBW || spec.maxAudioBW;
+        if (options.maxAudioBW && spec.maxAudioBW && options.maxAudioBW > spec.maxAudioBW) {
+            options.maxAudioBW = spec.maxAudioBW;
         }
 
         // 1- If the stream is not local we do nothing.
