@@ -26,6 +26,11 @@ Erizo.Room = function (spec) {
         CONNECTING = 1,
         CONNECTED = 2;
 
+    // currently running subscribe requests
+    var subscribeRequests = {};
+    // max duration for a request to block reconnects, in milliseconds
+    var REQUEST_MAX_DURATION = 10000;
+
     that.remoteStreams = {};
     that.localStreams = {};
     that.roomID = '';
@@ -516,10 +521,19 @@ Erizo.Room = function (spec) {
     // It subscribe to a remote stream and draws it inside the HTML tag given by the ID='elementID'
     that.subscribe = function (stream, options, callback) {
 
+        if (subscribeRequests[stream.getID()]) {
+            L.Logger.info("Repeated subscribe request ignored");
+            return;
+        }
         options = options || {};
 
         if (!stream.local) {
-
+            var streamId = stream.getID();
+            subscribeRequests[streamId] = {
+                requestTimeoutHandle: setTimeout(function() {
+                    delete subscribeRequests[streamId];
+                }, REQUEST_MAX_DURATION)
+            };
             if (stream.hasVideo() || stream.hasAudio() || stream.hasScreen()) {
                 // 1- Subscribe to Stream
 
@@ -531,8 +545,13 @@ Erizo.Room = function (spec) {
                     sendSDPSocket('subscribe', {streamId: stream.getID(), audio: options.audio, video: options.video, data: options.data, browser: Erizo.getBrowser()}, undefined, function (result, error) {
                         if (result === null) {
                             L.Logger.error('Error subscribing to stream ', error);
-                            if (callback)
+                            if (callback) {
                                 callback(undefined, error);
+                                if (subscribeRequests[streamId]) {
+                                    clearTimeout(subscribeRequests[streamId].requestTimeoutHandle);
+                                    delete subscribeRequests[streamId];
+                                }
+                            }
                             return;
                         }
 
@@ -549,6 +568,10 @@ Erizo.Room = function (spec) {
                             stream.stream = evt.stream;
                             var evt2 = Erizo.StreamEvent({type: 'stream-subscribed', stream: stream});
                             that.dispatchEvent(evt2);
+                            if (subscribeRequests[streamId]) {
+                                clearTimeout(subscribeRequests[streamId].requestTimeoutHandle);
+                                delete subscribeRequests[streamId];
+                            }
                         };
                         stream.pc.createOffer(true);
                         if(callback) callback(true);
@@ -580,6 +603,11 @@ Erizo.Room = function (spec) {
 
     // It unsubscribes from the stream, removing the HTML element.
     that.unsubscribe = function (stream, callback) {
+        var streamId = stream.getID();
+        if (subscribeRequests[streamId]) {
+            clearTimeout(subscribeRequests[streamId].requestTimeoutHandle);
+            delete subscribeRequests[streamId];
+        }
 
         // Unsubscribe from stream stream
         if (that.socket !== undefined) {
