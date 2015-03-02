@@ -31,6 +31,13 @@ enum Profile {
   AVPF, SAVPF
 };
 /**
+ * Connection direction as described in the Sdp - answer MUST match when restrictions are sent.
+ */
+enum ConnectionDirection {
+    SENDRECV, SENDONLY, RECVONLY, INACTIVE
+};
+
+/**
  * SRTP info.
  */
 class CryptoInfo {
@@ -240,6 +247,8 @@ private:
     std::vector<RtpMap> internalPayloadVector_;
     std::string iceVideoUsername_, iceAudioUsername_;
     std::string iceVideoPassword_, iceAudioPassword_;
+    // the connection direction for audio and video
+    ConnectionDirection audioDirection_, videoDirection_;
 };
 }/* namespace erizo */
 #endif /* SDPPROCESSOR_H_ */

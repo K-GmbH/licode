@@ -30,6 +30,10 @@ namespace erizo {
   static const char *rtcpmux = "a=rtcp-mux";
   static const char *fp = "a=fingerprint";
   static const char *rtcpfb = "a=rtcp-fb:";
+  static const char *sendrecv = "a=sendrecv";
+  static const char *sendonly = "a=sendonly";
+  static const char *recvonly = "a=recvonly";
+  static const char *inactive = "a=inactive";
 
   SdpInfo::SdpInfo() {
     isBundle = false;
@@ -44,6 +48,8 @@ namespace erizo {
     audioCodecs = 0;
     videoSdpMLine = -1;
     audioSdpMLine = -1;
+    audioDirection_ = SENDRECV;
+    videoDirection_ = SENDRECV;
 
     RtpMap vp8;
     vp8.payloadType = VP8_90000_PT;
@@ -292,7 +298,15 @@ namespace erizo {
       if (isFingerprint) {
         sdp << "a=fingerprint:sha-256 "<< fingerprint << endl;
       }
-      sdp << "a=sendrecv" << endl;
+      if (audioDirection_ == SENDRECV) {
+        sdp << sendrecv << endl;
+      } else if (audioDirection_ == SENDONLY) {
+        sdp << sendonly << endl;
+      } else if (audioDirection_ == RECVONLY) {
+          sdp << recvonly << endl;
+      } else {
+          sdp << inactive << endl;
+      }
       sdp << "a=mid:audio\n";
       sdp << "a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level" << endl;
       if (isRtcpMux)
@@ -366,7 +380,15 @@ namespace erizo {
       if (isFingerprint) {
         sdp << "a=fingerprint:sha-256 "<< fingerprint << endl;
       }
-      sdp << "a=sendrecv" << endl;
+      if (videoDirection_ == SENDRECV) {
+        sdp << sendrecv << endl;
+      } else if (videoDirection_ == SENDONLY) {
+        sdp << sendonly << endl;
+      } else if (videoDirection_ == RECVONLY) {
+          sdp << recvonly << endl;
+      } else {
+          sdp << inactive << endl;
+      }
       sdp << "a=mid:video\n";
       if (isRtcpMux)
         sdp << "a=rtcp-mux\n";
@@ -451,6 +473,21 @@ namespace erizo {
     this->hasAudio = offerSdp.hasAudio;
     ELOG_DEBUG("Setting SourceSDP");
 
+    if (offerSdp.videoDirection_ == RECVONLY) {
+        this->videoDirection_ = SENDONLY;
+    } else if (offerSdp.videoDirection_ == SENDONLY) {
+        this->videoDirection_ = RECVONLY;
+    } else {
+        this->videoDirection_ = offerSdp.videoDirection_;
+    }
+
+    if (offerSdp.audioDirection_ == RECVONLY) {
+        this->audioDirection_ = SENDONLY;
+    } else if (offerSdp.audioDirection_ == SENDONLY) {
+        this->videoDirection_ = RECVONLY;
+    } else {
+        this->videoDirection_ = offerSdp.audioDirection_;
+    }
   }
 
   bool SdpInfo::processSdp(const std::string& sdp, const std::string& media) {
@@ -480,6 +517,8 @@ namespace erizo {
       size_t isRtcpMuxchar = line.find(rtcpmux);
       size_t isFP = line.find(fp);
       size_t isFeedback = line.find(rtcpfb);
+      size_t isSendOnly = line.find(sendonly);
+      size_t isRecvOnly = line.find(recvonly);
 
       ELOG_DEBUG("current line -> %s", line.c_str());
 
@@ -515,6 +554,13 @@ namespace erizo {
         ELOG_DEBUG("sdp has audio, mline = %d",audioSdpMLine);
         mtype = AUDIO_TYPE;
         hasAudio = true;
+      }
+      if (isSendOnly != std::string::npos) {
+        if (mtype == AUDIO_TYPE) audioDirection_ = SENDONLY;
+        else if (mtype == VIDEO_TYPE) videoDirection_ = SENDONLY;
+      } else if (isRecvOnly != std::string::npos) {
+        if (mtype == AUDIO_TYPE) audioDirection_ = RECVONLY;
+        else if (mtype == VIDEO_TYPE) videoDirection_ = RECVONLY;
       }
       if (isCand != std::string::npos) {
         std::vector<std::string> pieces = stringutil::splitOneOf(line, " :");
