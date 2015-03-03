@@ -205,6 +205,7 @@ Erizo.Room = function (spec) {
             var stream = that.remoteStreams[arg.id],
                 evt;
             delete that.remoteStreams[arg.id];
+            delete that.localStreams[arg.id];
             removeStream(stream);
             evt = Erizo.StreamEvent({type: 'stream-removed', stream: stream});
             that.dispatchEvent(evt);
